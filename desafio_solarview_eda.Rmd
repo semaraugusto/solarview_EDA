@@ -1,0 +1,240 @@
+---
+title: "Desafio Solarview"
+author: "Semar Augusto"
+date: "10/22/2018"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+Sobre o banco de dados, o arquivo pjm_est j?? possui uma tabela com um banco de dados que pode ser fornecido como uma tabela. Apenas alguns ajustes precisam ser feitos, como: pjm_load ?? uma coluna que corresponde ?? soma da venda de todas as outras regi??es, ent??o ?? interessante que o SQL fa??a esse trabalho sozinho e n??o dependa que o usu??rio do banco fa??a esse trabalho manualmente todas as vezes.
+
+# Loading libraries and reading data
+```{r, echo=FALSE, include=FALSE}
+require(DT)
+require(fpp2)
+require(data.table)
+require(tidyverse)
+require(prophet)
+require(forecast)
+
+pjm_est <- read.table("data/pjm_hourly_est.csv", sep=",", header=T)
+pjm_load <- read.table("data/PJM_Load_hourly.csv", sep=",", header=T)
+pjme <- read.table("data/PJME_hourly.csv", sep=",", header=T)
+pjmw <- read.table("data/PJMW_hourly.csv", sep=",", header=T)
+
+pjm_est$datetime <- pjm_est$Datetime
+pjm_est <- separate(pjm_est, datetime, into=c("Date", "Hour"), sep = " ")
+
+pjm_load$datetime <- pjm_load$Datetime
+pjm_load <- separate(pjm_load, datetime, into=c("Date", "Hour"), sep = " ")
+
+pjme$datetime <- pjme$Datetime
+pjme <- separate(pjme, datetime, into=c("Date", "Hour"), sep = " ")
+
+pjmw$datetime <- pjmw$Datetime
+pjmw <- separate(pjmw, datetime, into=c("Date", "Hour"), sep = " ")
+
+pjm_est$sum <- rowSums(pjm_est[,2:13], na.rm=T)
+pjm_est <- pjm_est[with(pjm_est, order(Date)),]
+```
+
+```{r}
+head(pjm_est)
+summary(pjm_est)
+```
+
+# Creating time related features and visualizing
+
+## Day of the week visualization
+```{r}
+pjm_est$dow <- weekdays(as.Date(pjm_est$Datetime))
+ggplot(pjm_est, aes(x=dow, y=sum)) + geom_boxplot()
+```
+
+## Day of the month visualization
+```{r}
+pjm_est$dom <- strftime(as.Date(pjm_est$Date), format= "%d")
+ggplot(pjm_est, aes(x=dom, y=sum)) + geom_boxplot()
+```
+
+We can see that the fluctuations during the week is possibly what generates a fluctuation during the month.
+
+## Full month visualization
+```{r}
+pjm_est$month <- strftime(as.Date(pjm_est$Date), format="%m")
+ggplot(pjm_est, aes(x=month, y=sum)) + geom_boxplot()
+```
+
+## Hour of the day visualization
+```{r}
+ggplot(pjm_est, aes(x=Hour, y=sum)) + geom_boxplot()
+```
+
+Work hours are the ones that consume the most energy, as was expected
+
+
+Lets check if the the behaviour during winter is the same as during summer.
+
+# Winter vs Summer
+```{r}
+verao <- subset(pjm_est, month=='07')
+inverno <- subset(pjm_est, month=='01')
+nrow(verao)
+nrow(inverno)
+
+ggplot(verao, aes(x=Hour, y=sum)) + geom_boxplot()
+ggplot(inverno, aes(x=Hour, y=sum)) + geom_boxplot()
+```
+
+During winter the energy consumption is more stable during the day, while in the summer there are more peaks
+
+```{r}
+ggplot(verao, aes(x=dom, y=sum)) + geom_boxplot()
+ggplot(inverno, aes(x=dom, y=sum)) + geom_boxplot()
+```
+
+Month behaviour is approximately the same.
+
+```{r}
+ggplot(inverno, aes(x=dow, y=sum)) + geom_boxplot()
+ggplot(verao, aes(x=dow, y=sum)) + geom_boxplot()
+```
+
+Week behaviour is also similar
+
+Summer vacations seem to not change much the energy consumption.
+
+## Temporal series
+```{r}
+train_sample <- setDT(pjm_est)
+time <- ts(train_sample[,"sum"], start=1998,frequency=365*24)
+autoplot(time)
+```
+
+Too much variation until 2005. The company grew a lot and that may bias the predictor. Lets get a subset of the data.
+
+```{r}
+pjm_est$Date <- as.Date(pjm_est$Date)
+df <- subset(pjm_est, Date > as.Date("2005-01-01"))
+new_tra <- setDT(df)
+new_time <- ts(new_tra[,"sum"], start=2002, frequency=365*24)
+autoplot(new_time)
+```
+
+Other good alternative would be to get a smaller region like PJM East.
+```{r}
+pjme <- pjm_est[,c(1,11,14,15,16,17,18,19)]
+pjme <- pjme[complete.cases(pjme),]
+tra <- setDT(pjme)
+time <- ts(tra[,"PJME"], start=2002, end=2018, frequency=365*24)
+autoplot(time)
+```
+However, we can see that PJME's behaviour is much different from the company as a whole.
+
+```{r}
+summary(pjm_est$PJME/pjm_est$sum)
+nrow(pjme)/nrow(pjm_est)
+nrow(df)/nrow(pjm_est)
+```
+
+A more complex analysis could make a predictor for every region by itself, or considering that hollidays may change consumption. However, in this notebook I will make a simple predictor without any of this hypotesis.
+
+# Predictive Analysis
+```{r}
+splitting_date <- as.Date('2014-06-01')
+ts_df <- ts(df[,"sum"], frequency=365*24)
+train <- subset(ts_df, end=length(ts_df)-365*24*3.5)
+
+length(train)/length(ts_df)
+```
+
+## Checking if residuals are white noise
+```{r}
+holt_model <- holt(ts_df)
+autoplot(holt_model)
+checkresiduals(holt_model)
+```
+
+p-value < 0.05, the trends are probably not white noise.
+
+# Testing different predictive algorithms
+
+## Naive Model
+
+```{r}
+nv <- naive(train, h=3.5*365*24)
+autoplot(nv)
+accuracy(nv, ts_df)
+```
+
+## ETS Model
+
+```{r}
+fcets <- ets(train)
+autoplot(forecast(fcets))
+accuracy(forecast(fcets), ts_df)
+```
+
+## PROPHET Model 
+```{r}
+splitting_date <- as.Date('2014-06-01')
+train_df <- subset(df, Date < splitting_date)
+stats = data.frame(y=log1p(train_df$sum), ds=train_df$Datetime)
+stats = aggregate(stats$y, by=list(stats$ds), FUN=sum) # juntando se houverem 2 datetimes iguais
+colnames(stats) <- c("ds", "y")
+head(stats)
+proph = prophet(stats)
+
+```
+
+### Preparing test dataset
+```{r}
+test_df <- subset(df, Date >= splitting_date)
+test = data.frame(y=log1p(test_df$sum), ds=test_df$Datetime)
+test = aggregate(test$y, by=list(test$ds), FUN=sum) # juntando se houverem 2 datetimes iguais
+colnames(test) <- c("ds", "y")
+```
+
+### Making prediction
+```{r}
+future = make_future_dataframe(proph, periods=3.5*365*24)
+prediction = predict(proph, future)
+mean_pred = prediction[,c("ds", "yhat")]
+
+prophet_plot_components(proph, prediction)
+```
+
+### Retransforming data to MW
+```{r}
+mean_pred$yhat = expm1(mean_pred$yhat)
+head(mean_pred)
+```
+
+### Calculating accuracy.
+```{r}
+ts_pred <- ts(mean_pred[,"yhat"], frequency=365*24)
+ts_test <- ts(test_df[, "sum"], frequency=365*24)
+ts_pred <- subset(ts_pred, end=length(ts_test)) # deixando ambos com mesmo tamanho pois a predic??o foi feita com valor aproximado de per??odos
+accuracy(ts_pred, ts_test)
+autoplot(ts_pred)
+autoplot(ts_test)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
